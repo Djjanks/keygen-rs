@@ -8,6 +8,11 @@ use crate::license::{LicenseValidationRequest, LicenseValidationResult};
 #[cfg(feature = "token")]
 use crate::profile::CurrentProfile;
 use crate::service::ServiceInfo;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{
+    artifact::Artifact,
+    release::{ArtifactDownloadOptions, Release},
+};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -55,6 +60,26 @@ impl KeygenClient {
 
     pub async fn service_info(&self) -> Result<ServiceInfo, Error> {
         crate::service::get_service_info_with_client(&self.transport).await
+    }
+
+    /// Download a release artifact to `path` and verify it. See [`Release::download_artifact_to`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn download_artifact_to(
+        &self,
+        release: &Release,
+        artifact: &str,
+        path: impl AsRef<std::path::Path>,
+        options: Option<ArtifactDownloadOptions>,
+    ) -> Result<Artifact, Error> {
+        crate::release::download_with_client(
+            &self.transport,
+            &self.config,
+            release,
+            artifact,
+            path.as_ref(),
+            options,
+        )
+        .await
     }
 
     /// Retrieves the bearer and token used to authenticate this client.
