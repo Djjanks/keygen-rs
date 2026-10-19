@@ -1,5 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))]
-use crate::artifact::ArtifactResponse;
+use crate::artifact::{parse_signing_public_key, ArtifactResponse, ArtifactVerifier};
 use crate::artifact::{Artifact, ListArtifactsOptions};
 use crate::client::{Client, ClientOptions};
 use crate::config::{get_config, KeygenConfig};
@@ -13,6 +13,13 @@ use crate::KeygenResponseData;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 fn serialize_string_vec<S>(value: &Option<Vec<String>>, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -233,6 +240,148 @@ pub(crate) async fn download_artifact_with_client(
     })
 }
 
+/// Download progress callback: downloaded bytes and the file size, if known.
+#[cfg(not(target_arch = "wasm32"))]
+pub type DownloadProgress = Box<dyn FnMut(u64, Option<u64>) + Send>;
+
+/// Options for [`Release::download`].
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+pub struct ArtifactDownloadOptions {
+    /// Hex Ed25519 public key from `keygen genkey` (not the account public key).
+    /// When set, the artifact must be signed and its checksum is optional;
+    /// when unset, only the checksum is verified and it is required.
+    pub public_key: Option<String>,
+    /// Called with the downloaded byte count and the file size, if known.
+    pub on_progress: Option<DownloadProgress>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for ArtifactDownloadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArtifactDownloadOptions")
+            .field("public_key", &self.public_key)
+            .field("on_progress", &self.on_progress.is_some())
+            .finish()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn download_to_writer_with_client<W>(
+    client: &Client,
+    config: &KeygenConfig,
+    release: &Release,
+    artifact: &str,
+    writer: &mut W,
+    options: Option<ArtifactDownloadOptions>,
+) -> Result<Artifact, Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut options = options.unwrap_or_default();
+    if let Some(public_key) = &options.public_key {
+        let is_account_key = config
+            .public_key
+            .as_deref()
+            .is_some_and(|account_key| account_key.eq_ignore_ascii_case(public_key));
+        if is_account_key {
+            return Err(Error::ArtifactPublicKeyInvalid(
+                "the account public key does not sign artifacts, use the key from `keygen genkey`"
+                    .to_string(),
+            ));
+        }
+        parse_signing_public_key(public_key)?;
+    }
+
+    let download = download_artifact_with_client(client, &release.id, artifact).await?;
+    let artifact = download.artifact.ok_or_else(|| {
+        Error::InvalidResponse("artifact download response has no artifact".to_string())
+    })?;
+
+    // Ed25519ph context is the product ID, as in keygen-go and `keygen upload`.
+    // The release's product comes first: `upgrade_from` may target another product.
+    let context = release
+        .product_id
+        .as_deref()
+        .or(Some(config.product.as_str()).filter(|product| !product.is_empty()));
+    let context = match (&options.public_key, context) {
+        (Some(_), None) => {
+            return Err(Error::ArtifactSignatureInvalid(
+                "product ID for the signature context is unknown".to_string(),
+            ))
+        }
+        (_, context) => context.unwrap_or_default(),
+    };
+    let mut verifier = ArtifactVerifier::new(&artifact, options.public_key.as_deref(), context)?;
+
+    // Presigned storage URL: no Keygen auth, and no overall timeout so that large
+    // files are not cut off — only stalled connections are.
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(30))
+        .build()?;
+    let mut response = http.get(&download.location).send().await?;
+    if !response.status().is_success() {
+        return Err(Error::UnexpectedError(format!(
+            "Artifact download failed with status {}",
+            response.status()
+        )));
+    }
+
+    let mut downloaded = 0u64;
+    while let Some(chunk) = response.chunk().await? {
+        writer
+            .write_all(&chunk)
+            .await
+            .map_err(|e| Error::UnexpectedError(format!("Failed to write artifact: {e}")))?;
+        verifier.update(&chunk);
+        downloaded += chunk.len() as u64;
+        if let Some(on_progress) = options.on_progress.as_mut() {
+            on_progress(downloaded, artifact.filesize);
+        }
+    }
+    writer
+        .flush()
+        .await
+        .map_err(|e| Error::UnexpectedError(format!("Failed to write artifact: {e}")))?;
+
+    verifier.finish()?;
+    Ok(artifact)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn download_with_client(
+    client: &Client,
+    config: &KeygenConfig,
+    release: &Release,
+    artifact: &str,
+    path: &Path,
+    options: Option<ArtifactDownloadOptions>,
+) -> Result<Artifact, Error> {
+    let mut part = path.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+
+    let result = async {
+        let io_error =
+            |e: std::io::Error| Error::UnexpectedError(format!("Failed to write artifact: {e}"));
+        let mut file = tokio::fs::File::create(&part).await.map_err(io_error)?;
+        let artifact =
+            download_to_writer_with_client(client, config, release, artifact, &mut file, options)
+                .await?;
+        file.sync_all().await.map_err(io_error)?;
+        drop(file);
+        tokio::fs::rename(&part, path).await.map_err(io_error)?;
+        Ok(artifact)
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&part).await;
+    }
+    result
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConstraintAttributes {
     pub created: String,
@@ -373,6 +522,9 @@ impl Release {
     /// Download an artifact by ID or filename, returning the redirect URL
     /// and the artifact (with its checksum and signature) from the response body.
     ///
+    /// The file itself is neither downloaded nor verified — use [`download`](Self::download)
+    /// for that.
+    ///
     /// API errors are returned as [`Error::Api`].
     ///
     /// Not available on WASM targets — use [`artifact_download_url`](Self::artifact_download_url)
@@ -384,6 +536,27 @@ impl Release {
     ) -> Result<ReleaseArtifactDownload, Error> {
         let client = Client::from_global_config()?;
         download_artifact_with_client(&client, &self.id, artifact).await
+    }
+
+    /// Download an artifact by ID or filename to `path` and verify it.
+    ///
+    /// The file is written to `<path>.part` and renamed to `path` only after it was
+    /// verified; on error nothing is left behind. With [`ArtifactDownloadOptions::public_key`]
+    /// the signature is required (it covers the SHA-512 of the file) and the checksum is
+    /// checked if present; without it the checksum is required.
+    ///
+    /// The signature context is the release's product, falling back to
+    /// [`KeygenConfig::product`]. Replacing the running executable is left to the application.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn download(
+        &self,
+        artifact: &str,
+        path: impl AsRef<Path>,
+        options: Option<ArtifactDownloadOptions>,
+    ) -> Result<Artifact, Error> {
+        let config = get_config()?;
+        let client = Client::new(ClientOptions::from(config.clone()))?;
+        download_with_client(&client, &config, self, artifact, path.as_ref(), options).await
     }
 
     /// List artifacts scoped to this release.
@@ -835,6 +1008,314 @@ mod tests {
 
             assert!(matches!(err, Error::Api(_)));
             assert_eq!(err.api_error_kind(), ApiErrorKind::NotFound);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod download {
+        use super::*;
+        use crate::artifact::tests::verifier::{CHECKSUM, CONTEXT, PAYLOAD, PUBLIC_KEY, SIGNATURE};
+        use mockito::{mock, server_url, Matcher, Mock};
+        use serde_json::json;
+        use std::sync::{Arc, Mutex};
+
+        fn config() -> KeygenConfig {
+            KeygenConfig {
+                api_url: server_url(),
+                account: "test_account".to_string(),
+                product: CONTEXT.to_string(),
+                license_key: Some("test-license-key".to_string()),
+                ..Default::default()
+            }
+        }
+
+        fn release(id: &str) -> Release {
+            Release {
+                id: id.to_string(),
+                name: None,
+                description: None,
+                version: "1.1.0".to_string(),
+                semver: None,
+                channel: ReleaseChannel::Stable,
+                status: ReleaseStatus::Published,
+                tag: None,
+                metadata: None,
+                created: "2024-01-01T00:00:00Z".to_string(),
+                updated: "2024-01-01T00:00:00Z".to_string(),
+                yanked_at: None,
+                product_id: None,
+                package_id: None,
+                account_id: None,
+            }
+        }
+
+        /// Mocks the artifact redirect for `release_id` and the file behind it.
+        fn mock_artifact(
+            release_id: &str,
+            checksum: Option<&str>,
+            signature: Option<&str>,
+            payload: &[u8],
+        ) -> (Mock, Mock) {
+            let file_path = format!("/files/{release_id}/app");
+            let redirect = mock(
+                "GET",
+                format!("/v1/releases/{release_id}/artifacts/app").as_str(),
+            )
+            .with_status(303)
+            .with_header("content-type", "application/vnd.api+json")
+            .with_header("location", &format!("{}{file_path}", server_url()))
+            .with_body(
+                json!({
+                    "data": {
+                        "id": "artifact-1",
+                        "type": "artifacts",
+                        "attributes": {
+                            "filename": "app",
+                            "filesize": payload.len(),
+                            "checksum": checksum,
+                            "signature": signature,
+                            "status": "UPLOADED",
+                            "created": "2024-01-01T00:00:00Z",
+                            "updated": "2024-01-01T00:00:00Z"
+                        },
+                        "relationships": {}
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+            let file = mock("GET", file_path.as_str())
+                .match_header("authorization", Matcher::Missing)
+                .with_status(200)
+                .with_body(payload)
+                .create();
+            (redirect, file)
+        }
+
+        fn client(config: &KeygenConfig) -> Client {
+            Client::new(ClientOptions::from(config.clone())).unwrap()
+        }
+
+        #[tokio::test]
+        async fn downloads_and_verifies_signed_artifact() {
+            let (_redirect, file) =
+                mock_artifact("dl-signed", Some(CHECKSUM), Some(SIGNATURE), PAYLOAD);
+            let progress = Arc::new(Mutex::new(Vec::new()));
+            let progress_sink = Arc::clone(&progress);
+            let options = ArtifactDownloadOptions {
+                public_key: Some(PUBLIC_KEY.to_string()),
+                on_progress: Some(Box::new(move |done, total| {
+                    progress_sink.lock().unwrap().push((done, total));
+                })),
+            };
+
+            let config = config();
+            let mut output = Vec::new();
+            let artifact = download_to_writer_with_client(
+                &client(&config),
+                &config,
+                &release("dl-signed"),
+                "app",
+                &mut output,
+                Some(options),
+            )
+            .await
+            .expect("signed artifact should download");
+
+            file.assert();
+            assert_eq!(artifact.id, "artifact-1");
+            assert_eq!(output, PAYLOAD);
+            let total = Some(PAYLOAD.len() as u64);
+            assert_eq!(
+                progress.lock().unwrap().last(),
+                Some(&(PAYLOAD.len() as u64, total))
+            );
+        }
+
+        #[tokio::test]
+        async fn rejects_tampered_file() {
+            let (_redirect, _file) =
+                mock_artifact("dl-tampered", Some(CHECKSUM), None, b"hello keygen!");
+            let config = config();
+
+            let err = download_to_writer_with_client(
+                &client(&config),
+                &config,
+                &release("dl-tampered"),
+                "app",
+                &mut Vec::new(),
+                None,
+            )
+            .await
+            .expect_err("tampered file should fail");
+
+            assert!(matches!(err, Error::ArtifactChecksumMismatch));
+        }
+
+        #[tokio::test]
+        async fn requires_checksum() {
+            let (_redirect, file) = mock_artifact("dl-unverified", None, None, PAYLOAD);
+            let file = file.expect(0);
+            let config = config();
+
+            let err = download_to_writer_with_client(
+                &client(&config),
+                &config,
+                &release("dl-unverified"),
+                "app",
+                &mut Vec::new(),
+                None,
+            )
+            .await
+            .expect_err("missing checksum should fail");
+
+            assert!(matches!(err, Error::ArtifactChecksumMissing));
+            file.assert();
+        }
+
+        #[tokio::test]
+        async fn signature_context_is_release_product() {
+            let (_redirect, _file) =
+                mock_artifact("dl-context", Some(CHECKSUM), Some(SIGNATURE), PAYLOAD);
+            let config = KeygenConfig {
+                product: "other-product-id".to_string(),
+                ..config()
+            };
+            let options = ArtifactDownloadOptions {
+                public_key: Some(PUBLIC_KEY.to_string()),
+                ..Default::default()
+            };
+
+            download_to_writer_with_client(
+                &client(&config),
+                &config,
+                &Release {
+                    product_id: Some(CONTEXT.to_string()),
+                    ..release("dl-context")
+                },
+                "app",
+                &mut Vec::new(),
+                Some(options),
+            )
+            .await
+            .expect("release product should be the signature context");
+        }
+
+        #[tokio::test]
+        async fn requires_signature_when_public_key_is_set() {
+            let (_redirect, file) = mock_artifact("dl-unsigned", Some(CHECKSUM), None, PAYLOAD);
+            let file = file.expect(0);
+            let config = config();
+            let options = ArtifactDownloadOptions {
+                public_key: Some(PUBLIC_KEY.to_string()),
+                ..Default::default()
+            };
+
+            let err = download_to_writer_with_client(
+                &client(&config),
+                &config,
+                &release("dl-unsigned"),
+                "app",
+                &mut Vec::new(),
+                Some(options),
+            )
+            .await
+            .expect_err("unsigned artifact should fail");
+
+            assert!(matches!(err, Error::ArtifactSignatureMissing));
+            file.assert();
+        }
+
+        #[tokio::test]
+        async fn rejects_account_public_key() {
+            let redirect = mock("GET", "/v1/releases/dl-account-key/artifacts/app")
+                .expect(0)
+                .create();
+            let config = KeygenConfig {
+                public_key: Some(PUBLIC_KEY.to_uppercase()),
+                ..config()
+            };
+            let options = ArtifactDownloadOptions {
+                public_key: Some(PUBLIC_KEY.to_string()),
+                ..Default::default()
+            };
+
+            let err = download_to_writer_with_client(
+                &client(&KeygenConfig {
+                    public_key: None,
+                    ..config.clone()
+                }),
+                &config,
+                &release("dl-account-key"),
+                "app",
+                &mut Vec::new(),
+                Some(options),
+            )
+            .await
+            .expect_err("account key should be rejected");
+
+            assert!(matches!(err, Error::ArtifactPublicKeyInvalid(_)));
+            redirect.assert();
+        }
+
+        fn temp_path(name: &str) -> PathBuf {
+            std::env::temp_dir()
+                .join(format!("keygen-rs-{}", uuid::Uuid::new_v4()))
+                .join(name)
+        }
+
+        fn part_path(path: &Path) -> PathBuf {
+            let mut part = path.as_os_str().to_owned();
+            part.push(".part");
+            PathBuf::from(part)
+        }
+
+        #[tokio::test]
+        async fn download_to_path_renames_verified_file() {
+            let (_redirect, _file) = mock_artifact("dl-path", Some(CHECKSUM), None, PAYLOAD);
+            let config = config();
+            let path = temp_path("app");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+            download_with_client(
+                &client(&config),
+                &config,
+                &release("dl-path"),
+                "app",
+                &path,
+                None,
+            )
+            .await
+            .expect("download should succeed");
+
+            assert_eq!(std::fs::read(&path).unwrap(), PAYLOAD);
+            assert!(!part_path(&path).exists());
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+
+        #[tokio::test]
+        async fn download_to_path_leaves_nothing_on_mismatch() {
+            let (_redirect, _file) =
+                mock_artifact("dl-path-bad", Some(CHECKSUM), None, b"hello keygen!");
+            let config = config();
+            let path = temp_path("app");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+            let err = download_with_client(
+                &client(&config),
+                &config,
+                &release("dl-path-bad"),
+                "app",
+                &path,
+                None,
+            )
+            .await
+            .expect_err("mismatch should fail");
+
+            assert!(matches!(err, Error::ArtifactChecksumMismatch));
+            assert!(!path.exists());
+            assert!(!part_path(&path).exists());
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
         }
     }
 
