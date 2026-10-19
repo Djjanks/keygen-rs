@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+use crate::artifact::ArtifactResponse;
 use crate::artifact::{Artifact, ListArtifactsOptions};
 use crate::client::{Client, ClientOptions};
 use crate::config::{get_config, KeygenConfig};
@@ -9,8 +11,6 @@ use crate::KeygenRelationship;
 use crate::KeygenResponseData;
 #[cfg(not(target_arch = "wasm32"))]
 use reqwest::header::HeaderMap;
-#[cfg(not(target_arch = "wasm32"))]
-use reqwest::{redirect::Policy, Client as ReqwestClient};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 
@@ -197,8 +197,40 @@ pub(crate) async fn upgrade_from_with_client(
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct ReleaseArtifactDownload {
+    /// Redirect URL of the artifact file.
     pub location: String,
     pub headers: HeaderMap,
+    /// Artifact returned in the redirect response body, if any.
+    pub artifact: Option<Artifact>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn download_artifact_with_client(
+    client: &Client,
+    release_id: &str,
+    artifact: &str,
+) -> Result<ReleaseArtifactDownload, Error> {
+    let path = format!("releases/{release_id}/artifacts/{artifact}");
+    let response = client.get::<(), serde_json::Value>(&path, None).await?;
+
+    let location = response
+        .headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Error::UnexpectedError("Missing redirect Location header".to_string()))?
+        .to_string();
+    let artifact = if response.body.is_null() {
+        None
+    } else {
+        let artifact_response: ArtifactResponse = serde_json::from_value(response.body)?;
+        Some(Artifact::from(artifact_response.data))
+    };
+
+    Ok(ReleaseArtifactDownload {
+        location,
+        headers: response.headers,
+        artifact,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,7 +370,10 @@ impl Release {
         Ok(url.to_string())
     }
 
-    /// Download an artifact by ID or filename, returning the redirect URL.
+    /// Download an artifact by ID or filename, returning the redirect URL
+    /// and the artifact (with its checksum and signature) from the response body.
+    ///
+    /// API errors are returned as [`Error::Api`].
     ///
     /// Not available on WASM targets — use [`artifact_download_url`](Self::artifact_download_url)
     /// instead and handle the redirect from JavaScript.
@@ -348,33 +383,7 @@ impl Release {
         artifact: &str,
     ) -> Result<ReleaseArtifactDownload, Error> {
         let client = Client::from_global_config()?;
-        let path = format!("releases/{}/artifacts/{}", self.id, artifact);
-        let request = client.build_request(reqwest::Method::GET, &path, None::<&()>, true)?;
-
-        let no_redirect = ReqwestClient::builder()
-            .redirect(Policy::none())
-            .build()
-            .map_err(|e| Error::UnexpectedError(format!("Failed to build HTTP client: {e}")))?;
-
-        let response = no_redirect.execute(request).await?;
-
-        if response.status().is_client_error() || response.status().is_server_error() {
-            let body = response.json().await?;
-            return Err(Error::KeygenApiError {
-                code: "DOWNLOAD_FAILED".to_string(),
-                detail: "Failed to download release artifact".to_string(),
-                body,
-            });
-        }
-
-        let headers = response.headers().clone();
-        let location = headers
-            .get(reqwest::header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| Error::UnexpectedError("Missing redirect Location header".to_string()))?
-            .to_string();
-
-        Ok(ReleaseArtifactDownload { location, headers })
+        download_artifact_with_client(&client, &self.id, artifact).await
     }
 
     /// List artifacts scoped to this release.
@@ -744,6 +753,89 @@ mod tests {
         // Verify None values are not included
         assert!(!query.contains("page"));
         assert!(!query.contains("status"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod download_artifact {
+        use super::*;
+        use mockito::{mock, server_url};
+        use serde_json::json;
+
+        fn create_test_client() -> Client {
+            Client::new(ClientOptions::from(KeygenConfig {
+                api_url: server_url(),
+                account: "test_account".to_string(),
+                license_key: Some("test-license-key".to_string()),
+                ..Default::default()
+            }))
+            .expect("Failed to create test client")
+        }
+
+        #[tokio::test]
+        async fn returns_location_and_artifact_from_redirect() {
+            let _m = mock("GET", "/v1/releases/release-1/artifacts/app.zip")
+                .match_header("authorization", "License test-license-key")
+                .with_status(303)
+                .with_header("content-type", "application/vnd.api+json")
+                .with_header("location", "https://s3.example.com/app.zip")
+                .with_body(
+                    json!({
+                        "data": {
+                            "id": "artifact-1",
+                            "type": "artifacts",
+                            "attributes": {
+                                "filename": "app.zip",
+                                "filesize": 1024,
+                                "checksum": "Y2hlY2tzdW0",
+                                "signature": "c2lnbmF0dXJl",
+                                "status": "UPLOADED",
+                                "created": "2024-01-01T00:00:00Z",
+                                "updated": "2024-01-01T00:00:00Z"
+                            },
+                            "relationships": {}
+                        }
+                    })
+                    .to_string(),
+                )
+                .create();
+
+            let download =
+                download_artifact_with_client(&create_test_client(), "release-1", "app.zip")
+                    .await
+                    .expect("download should succeed");
+
+            assert_eq!(download.location, "https://s3.example.com/app.zip");
+            let artifact = download.artifact.expect("artifact should be parsed");
+            assert_eq!(artifact.id, "artifact-1");
+            assert_eq!(artifact.checksum.as_deref(), Some("Y2hlY2tzdW0"));
+            assert_eq!(artifact.signature.as_deref(), Some("c2lnbmF0dXJl"));
+        }
+
+        #[tokio::test]
+        async fn returns_api_error_when_artifact_is_missing() {
+            let _m = mock("GET", "/v1/releases/release-1/artifacts/missing.zip")
+                .with_status(404)
+                .with_header("content-type", "application/vnd.api+json")
+                .with_body(
+                    json!({
+                        "errors": [{
+                            "title": "Not found",
+                            "detail": "The requested artifact was not found",
+                            "code": "NOT_FOUND"
+                        }]
+                    })
+                    .to_string(),
+                )
+                .create();
+
+            let err =
+                download_artifact_with_client(&create_test_client(), "release-1", "missing.zip")
+                    .await
+                    .expect_err("missing artifact should be an error");
+
+            assert!(matches!(err, Error::Api(_)));
+            assert_eq!(err.api_error_kind(), ApiErrorKind::NotFound);
+        }
     }
 
     mod upgrade_from {
