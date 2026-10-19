@@ -1,6 +1,7 @@
 use crate::artifact::{Artifact, ListArtifactsOptions};
-use crate::client::Client;
-use crate::errors::Error;
+use crate::client::{Client, ClientOptions};
+use crate::config::{get_config, KeygenConfig};
+use crate::errors::{ApiErrorKind, Error};
 #[cfg(feature = "token")]
 use crate::insert_optional;
 use crate::license::PaginationOptions;
@@ -161,6 +162,38 @@ pub struct ReleaseUpgradeRequest {
     pub channel: Option<ReleaseChannel>,
 }
 
+impl ReleaseUpgradeRequest {
+    /// Fill unset `product`/`package` from the config and `channel` with stable.
+    fn with_defaults(request: Option<&Self>, config: &KeygenConfig) -> Self {
+        let request = request.cloned().unwrap_or_default();
+        let non_empty = |value: &str| (!value.is_empty()).then(|| value.to_string());
+        Self {
+            product: request.product.or_else(|| non_empty(&config.product)),
+            package: request.package.or_else(|| non_empty(&config.package)),
+            constraint: request.constraint,
+            channel: Some(request.channel.unwrap_or(ReleaseChannel::Stable)),
+        }
+    }
+}
+
+pub(crate) async fn upgrade_from_with_client(
+    client: &Client,
+    config: &KeygenConfig,
+    current_version: &str,
+    request: Option<&ReleaseUpgradeRequest>,
+) -> Result<Option<Release>, Error> {
+    let endpoint = format!("releases/{current_version}/upgrade");
+    let request = ReleaseUpgradeRequest::with_defaults(request, config);
+    match client.get(&endpoint, Some(&request)).await {
+        Ok(response) => {
+            let release_response: ReleaseResponse = serde_json::from_value(response.body)?;
+            Ok(Some(Release::from(release_response.data)))
+        }
+        Err(err) if err.api_error_kind() == ApiErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct ReleaseArtifactDownload {
@@ -271,6 +304,26 @@ impl Release {
         let response = client.get(&endpoint, request).await?;
         let release_response: ReleaseResponse = serde_json::from_value(response.body)?;
         Ok(Release::from(release_response.data))
+    }
+
+    /// Check whether an upgrade is available for `current_version` (e.g., `1.0.0`).
+    ///
+    /// Unset `product` and `package` default to [`KeygenConfig::product`] and
+    /// [`KeygenConfig::package`]. Unset `channel` defaults to [`ReleaseChannel::Stable`].
+    ///
+    /// Returns `Ok(None)` when Keygen responds with `NOT_FOUND`. Keygen does that not
+    /// only for the latest version, but also for unknown versions and for products the
+    /// license cannot access, so a misconfigured product looks like "no upgrade available".
+    /// The same goes for an expired license: depending on the policy's expiration strategy,
+    /// Keygen hides releases published after the expiry instead of returning an error,
+    /// so check the license status if this matters. A suspended license is an error.
+    pub async fn upgrade_from(
+        current_version: &str,
+        request: Option<&ReleaseUpgradeRequest>,
+    ) -> Result<Option<Release>, Error> {
+        let config = get_config()?;
+        let client = Client::new(ClientOptions::from(config.clone()))?;
+        upgrade_from_with_client(&client, &config, current_version, request).await
     }
 
     /// Build the download URL for an artifact by ID or filename.
@@ -691,5 +744,142 @@ mod tests {
         // Verify None values are not included
         assert!(!query.contains("page"));
         assert!(!query.contains("status"));
+    }
+
+    mod upgrade_from {
+        use super::*;
+        use crate::config::KeygenConfig;
+        use crate::KeygenClient;
+        use mockito::{mock, server_url, Matcher};
+        use serde_json::json;
+
+        fn create_test_client() -> KeygenClient {
+            KeygenClient::new(KeygenConfig {
+                api_url: server_url(),
+                account: "test_account".to_string(),
+                product: "config-product".to_string(),
+                license_key: Some("test-license-key".to_string()),
+                ..Default::default()
+            })
+            .expect("Failed to create test client")
+        }
+
+        #[tokio::test]
+        async fn returns_release_when_upgrade_is_available() {
+            let _m = mock("GET", "/v1/releases/1.0.0/upgrade")
+                .match_header("authorization", "License test-license-key")
+                .match_query(Matcher::AllOf(vec![
+                    Matcher::UrlEncoded("product".into(), "config-product".into()),
+                    Matcher::UrlEncoded("channel".into(), "stable".into()),
+                    Matcher::UrlEncoded("constraint".into(), "1.0".into()),
+                ]))
+                .with_status(200)
+                .with_header("content-type", "application/vnd.api+json")
+                .with_body(
+                    json!({
+                        "data": {
+                            "id": "release-2",
+                            "type": "releases",
+                            "attributes": {
+                                "version": "1.1.0",
+                                "channel": "stable",
+                                "status": "PUBLISHED",
+                                "created": "2024-01-01T00:00:00Z",
+                                "updated": "2024-01-01T00:00:00Z"
+                            },
+                            "relationships": {}
+                        }
+                    })
+                    .to_string(),
+                )
+                .create();
+
+            let request = ReleaseUpgradeRequest {
+                constraint: Some("1.0".to_string()),
+                ..Default::default()
+            };
+            let release = create_test_client()
+                .upgrade_from("1.0.0", Some(&request))
+                .await
+                .expect("upgrade check should succeed")
+                .expect("upgrade should be available");
+
+            assert_eq!(release.id, "release-2");
+            assert_eq!(release.version, "1.1.0");
+        }
+
+        #[tokio::test]
+        async fn returns_none_when_no_upgrade_is_available() {
+            let _m = mock("GET", "/v1/releases/1.1.0/upgrade")
+                .match_query(Matcher::Any)
+                .with_status(404)
+                .with_header("content-type", "application/vnd.api+json")
+                .with_body(
+                    json!({
+                        "errors": [{
+                            "title": "Not found",
+                            "detail": "No upgrade found for release",
+                            "code": "NOT_FOUND"
+                        }]
+                    })
+                    .to_string(),
+                )
+                .create();
+
+            let result = create_test_client().upgrade_from("1.1.0", None).await;
+
+            assert!(matches!(result, Ok(None)));
+        }
+
+        #[tokio::test]
+        async fn returns_error_when_license_is_not_allowed() {
+            let _m = mock("GET", "/v1/releases/1.2.0/upgrade")
+                .match_query(Matcher::Any)
+                .with_status(403)
+                .with_header("content-type", "application/vnd.api+json")
+                .with_body(
+                    json!({
+                        "errors": [{
+                            "title": "Access denied",
+                            "detail": "License is expired",
+                            "code": "LICENSE_EXPIRED"
+                        }]
+                    })
+                    .to_string(),
+                )
+                .create();
+
+            let err = create_test_client()
+                .upgrade_from("1.2.0", None)
+                .await
+                .expect_err("expired license should be an error");
+
+            assert_eq!(err.api_error_kind(), ApiErrorKind::LicenseExpired);
+        }
+
+        #[test]
+        fn explicit_request_overrides_config_defaults() {
+            let config = KeygenConfig {
+                product: "config-product".to_string(),
+                package: "config-package".to_string(),
+                ..Default::default()
+            };
+            let request = ReleaseUpgradeRequest {
+                product: Some("other-product".to_string()),
+                channel: Some(ReleaseChannel::Beta),
+                ..Default::default()
+            };
+
+            let query = serde_urlencoded::to_string(ReleaseUpgradeRequest::with_defaults(
+                Some(&request),
+                &config,
+            ))
+            .unwrap();
+
+            assert!(query.contains("product=other-product"));
+            assert!(query.contains("package=config-package"));
+            assert!(query.contains("channel=beta"));
+            assert!(!query.contains("constraint"));
+        }
     }
 }
