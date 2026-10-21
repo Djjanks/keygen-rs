@@ -9,12 +9,18 @@ use base64::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use ed25519_dalek::{Signature, VerifyingKey};
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+use reqwest::header::CONTENT_LENGTH;
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
 use sha2::{Digest, Sha512};
 use std::collections::HashMap;
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+use std::{path::Path, time::Duration};
 #[cfg(not(target_arch = "wasm32"))]
 use subtle::ConstantTimeEq;
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+use tokio::io::AsyncReadExt;
 
 /// Base64 of artifact checksums and signatures: `keygen upload` writes them unpadded
 /// by default, so encode without padding and accept both when decoding.
@@ -80,9 +86,11 @@ pub struct CreateArtifactRequest {
     pub platform: Option<String>,
     /// Optional: Target architecture (e.g., "amd64", "arm64")
     pub arch: Option<String>,
-    /// Optional: Signature for verification
+    /// Optional: Ed25519ph signature of the file, base64-encoded, with the product ID
+    /// as context (as `keygen upload --signing-key` produces). Required for downloads
+    /// that verify signatures with [`ArtifactDownloadOptions::public_key`](crate::release::ArtifactDownloadOptions::public_key).
     pub signature: Option<String>,
-    /// Optional: Checksum (e.g., SHA-256)
+    /// Optional: Checksum, base64-encoded SHA-512 digest of the file
     pub checksum: Option<String>,
     /// Optional: Custom metadata
     pub metadata: Option<HashMap<String, serde_json::Value>>,
@@ -305,63 +313,272 @@ impl ArtifactVerifier {
 }
 
 #[cfg(feature = "token")]
-impl Artifact {
-    /// Create a new artifact
-    ///
-    /// Note: After creating an artifact, you need to upload the actual file
-    /// using the upload URL provided in the response links.
-    pub async fn create(request: CreateArtifactRequest) -> Result<Artifact, Error> {
-        let client = Client::from_global_config()?;
+fn create_artifact_body(request: CreateArtifactRequest) -> Result<serde_json::Value, Error> {
+    let mut attributes = serde_json::Map::new();
+    attributes.insert(
+        "filename".to_string(),
+        serde_json::Value::String(request.filename),
+    );
 
-        let mut attributes = serde_json::Map::new();
+    if let Some(filetype) = request.filetype {
+        attributes.insert("filetype".to_string(), serde_json::Value::String(filetype));
+    }
+    if let Some(filesize) = request.filesize {
+        attributes.insert("filesize".to_string(), serde_json::json!(filesize));
+    }
+    if let Some(platform) = request.platform {
+        attributes.insert("platform".to_string(), serde_json::Value::String(platform));
+    }
+    if let Some(arch) = request.arch {
+        attributes.insert("arch".to_string(), serde_json::Value::String(arch));
+    }
+    if let Some(signature) = request.signature {
         attributes.insert(
-            "filename".to_string(),
-            serde_json::Value::String(request.filename),
+            "signature".to_string(),
+            serde_json::Value::String(signature),
         );
+    }
+    if let Some(checksum) = request.checksum {
+        attributes.insert("checksum".to_string(), serde_json::Value::String(checksum));
+    }
+    if let Some(metadata) = request.metadata {
+        attributes.insert("metadata".to_string(), serde_json::to_value(metadata)?);
+    }
 
-        if let Some(filetype) = request.filetype {
-            attributes.insert("filetype".to_string(), serde_json::Value::String(filetype));
-        }
-        if let Some(filesize) = request.filesize {
-            attributes.insert("filesize".to_string(), serde_json::json!(filesize));
-        }
-        if let Some(platform) = request.platform {
-            attributes.insert("platform".to_string(), serde_json::Value::String(platform));
-        }
-        if let Some(arch) = request.arch {
-            attributes.insert("arch".to_string(), serde_json::Value::String(arch));
-        }
-        if let Some(signature) = request.signature {
-            attributes.insert(
-                "signature".to_string(),
-                serde_json::Value::String(signature),
-            );
-        }
-        if let Some(checksum) = request.checksum {
-            attributes.insert("checksum".to_string(), serde_json::Value::String(checksum));
-        }
-        if let Some(metadata) = request.metadata {
-            attributes.insert("metadata".to_string(), serde_json::to_value(metadata)?);
-        }
-
-        let body = serde_json::json!({
-            "data": {
-                "type": "artifacts",
-                "attributes": attributes,
-                "relationships": {
-                    "release": {
-                        "data": {
-                            "type": "releases",
-                            "id": request.release_id
-                        }
+    Ok(serde_json::json!({
+        "data": {
+            "type": "artifacts",
+            "attributes": attributes,
+            "relationships": {
+                "release": {
+                    "data": {
+                        "type": "releases",
+                        "id": request.release_id
                     }
                 }
             }
-        });
+        }
+    }))
+}
 
+/// An artifact created by Keygen that is waiting for its file to be uploaded.
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+#[derive(Debug)]
+struct ArtifactUpload {
+    /// The created artifact, usually in the `WAITING` status.
+    artifact: Artifact,
+    /// Presigned URL to `PUT` the artifact file to.
+    url: String,
+}
+
+/// Upload progress callback: uploaded bytes and the file size.
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+pub type UploadProgress = Box<dyn FnMut(u64, u64) + Send>;
+
+/// Options for [`Artifact::create_and_upload`].
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+#[derive(Default)]
+pub struct ArtifactUploadOptions {
+    /// Called with the uploaded byte count and the file size while the file is sent.
+    /// Not called while the checksum is computed before the upload.
+    pub on_progress: Option<UploadProgress>,
+}
+
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+impl std::fmt::Debug for ArtifactUploadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArtifactUploadOptions")
+            .field("on_progress", &self.on_progress.is_some())
+            .finish()
+    }
+}
+
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+impl ArtifactUpload {
+    /// Stream a file from disk to the presigned URL.
+    ///
+    /// The request is sent without Keygen headers, since the storage provider
+    /// rejects requests that carry them.
+    async fn upload_file(
+        &self,
+        path: &Path,
+        on_progress: Option<UploadProgress>,
+    ) -> Result<(), Error> {
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| io_error(path, e))?;
+        let filesize = file.metadata().await.map_err(|e| io_error(path, e))?.len();
+
+        // Progress counts bytes handed to the HTTP client, not acknowledged by storage.
+        let chunks = futures::stream::try_unfold(
+            (file, on_progress, 0u64),
+            move |(mut file, mut on_progress, uploaded)| async move {
+                let mut buffer = vec![0; 64 * 1024];
+                let read = file.read(&mut buffer).await?;
+                if read == 0 {
+                    return Ok::<_, std::io::Error>(None);
+                }
+                buffer.truncate(read);
+                let uploaded = uploaded + read as u64;
+                if let Some(on_progress) = on_progress.as_mut() {
+                    on_progress(uploaded, filesize);
+                }
+                Ok(Some((buffer, (file, on_progress, uploaded))))
+            },
+        );
+
+        let request = upload_client()?
+            .put(&self.url)
+            .header(CONTENT_LENGTH, filesize)
+            .body(reqwest::Body::wrap_stream(chunks));
+        send_upload(request).await
+    }
+}
+
+/// Client for uploads to the storage provider: no Keygen headers and no total
+/// timeout, since artifacts can take longer than an API call to upload — only
+/// stalled connections are cut off.
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+fn upload_client() -> Result<reqwest::Client, Error> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::UnexpectedError(format!("Failed to build HTTP client: {e}")))
+}
+
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+async fn send_upload(request: reqwest::RequestBuilder) -> Result<(), Error> {
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(Error::UnexpectedError(format!(
+            "Artifact upload failed with status {status}: {body}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+fn io_error(path: &Path, error: std::io::Error) -> Error {
+    Error::UnexpectedError(format!("Failed to read {}: {error}", path.display()))
+}
+
+/// SHA-512 checksum of a file, in the format [`ArtifactVerifier`] and keygen-go
+/// verify downloaded artifacts against.
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+pub(crate) async fn file_checksum(path: &Path) -> Result<String, Error> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| io_error(path, e))?;
+    let mut hasher = Sha512::new();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|e| io_error(path, e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(ARTIFACT_BASE64.encode(hasher.finalize()))
+}
+
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+async fn create_upload_with_client(
+    client: &Client,
+    request: CreateArtifactRequest,
+) -> Result<ArtifactUpload, Error> {
+    let body = create_artifact_body(request)?;
+    let response = client
+        .post::<_, serde_json::Value, ()>("artifacts", Some(&body), None)
+        .await?;
+
+    let url = response
+        .headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Error::UnexpectedError("Missing upload Location header".to_string()))?
+        .to_string();
+    let artifact_response: ArtifactResponse = serde_json::from_value(response.body)?;
+
+    Ok(ArtifactUpload {
+        artifact: Artifact::from(artifact_response.data),
+        url,
+    })
+}
+
+#[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+pub(crate) async fn create_and_upload_with_client(
+    client: &Client,
+    mut request: CreateArtifactRequest,
+    path: &Path,
+    options: Option<ArtifactUploadOptions>,
+) -> Result<Artifact, Error> {
+    let options = options.unwrap_or_default();
+    if request.filesize.is_none() {
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| io_error(path, e))?;
+        request.filesize = Some(metadata.len());
+    }
+    if request.checksum.is_none() {
+        request.checksum = Some(file_checksum(path).await?);
+    }
+
+    let upload = create_upload_with_client(client, request).await?;
+    let endpoint = format!("artifacts/{}", upload.artifact.id);
+    if let Err(err) = upload.upload_file(path, options.on_progress).await {
+        // Do not leave a WAITING artifact behind: it would block retrying with
+        // the same filename. Cleanup is best-effort, the upload error is returned.
+        let _ = client.delete::<(), ()>(&endpoint, None).await;
+        return Err(err);
+    }
+
+    let response = client.get(&endpoint, None::<&()>).await?;
+    let artifact_response: ArtifactResponse = serde_json::from_value(response.body)?;
+    Ok(Artifact::from(artifact_response.data))
+}
+
+#[cfg(feature = "token")]
+impl Artifact {
+    /// Create a new artifact
+    ///
+    /// Only the artifact record is created: Keygen returns the upload URL in a
+    /// redirect, which is discarded here. Use [`Artifact::create_and_upload`] to
+    /// upload the file.
+    pub async fn create(request: CreateArtifactRequest) -> Result<Artifact, Error> {
+        let client = Client::from_global_config()?;
+        let body = create_artifact_body(request)?;
         let response = client.post("artifacts", Some(&body), None::<&()>).await?;
         let artifact_response: ArtifactResponse = serde_json::from_value(response.body)?;
         Ok(Artifact::from(artifact_response.data))
+    }
+
+    /// Create a new artifact and upload the file at `path`.
+    ///
+    /// `filesize` and `checksum` are computed from the file unless set in the request.
+    /// The file is read twice (for the checksum, then for the upload), so it must not
+    /// change in between. If the upload fails, the created artifact is deleted.
+    ///
+    /// The file is not signed: set [`CreateArtifactRequest::signature`] for downloads
+    /// that verify signatures.
+    ///
+    /// Returns the artifact fetched after the upload, usually still `WAITING`:
+    /// Keygen processes the file with a delay (about 30 seconds on Keygen Cloud),
+    /// and until the status is `UPLOADED` the artifact cannot be downloaded.
+    /// Check the status with [`Artifact::get`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn create_and_upload(
+        request: CreateArtifactRequest,
+        path: impl AsRef<Path>,
+        options: Option<ArtifactUploadOptions>,
+    ) -> Result<Artifact, Error> {
+        let client = Client::from_global_config()?;
+        create_and_upload_with_client(&client, request, path.as_ref(), options).await
     }
 
     /// Update an existing artifact
@@ -692,5 +909,240 @@ mod tests {
 
         let err = verify(&artifact(Some("not-base64!"), None), PAYLOAD, None, CONTEXT).err();
         assert!(matches!(err, Some(Error::ArtifactChecksumMismatch)));
+    }
+
+    #[cfg(all(feature = "token", not(target_arch = "wasm32")))]
+    mod upload {
+        use super::*;
+        use crate::client::ClientOptions;
+        use crate::config::KeygenConfig;
+        use mockito::{mock, server_url, Matcher};
+        use serde_json::json;
+
+        fn create_test_client() -> Client {
+            Client::new(ClientOptions::from(KeygenConfig {
+                api_url: server_url(),
+                account: "test_account".to_string(),
+                token: Some("test-token".to_string()),
+                ..Default::default()
+            }))
+            .expect("Failed to create test client")
+        }
+
+        fn artifact_body(id: &str, status: &str) -> String {
+            json!({
+                "data": {
+                    "id": id,
+                    "type": "artifacts",
+                    "attributes": {
+                        "filename": "app.zip",
+                        "filesize": 5,
+                        "status": status,
+                        "created": "2024-01-01T00:00:00Z",
+                        "updated": "2024-01-01T00:00:00Z"
+                    },
+                    "relationships": {}
+                }
+            })
+            .to_string()
+        }
+
+        fn create_request() -> CreateArtifactRequest {
+            CreateArtifactRequest {
+                filename: "app.zip".to_string(),
+                release_id: "release-1".to_string(),
+                filetype: None,
+                filesize: Some(5),
+                platform: None,
+                arch: None,
+                signature: None,
+                checksum: None,
+                metadata: None,
+            }
+        }
+
+        fn test_upload(path: &str) -> ArtifactUpload {
+            let response: ArtifactResponse =
+                serde_json::from_str(&artifact_body("artifact-1", "WAITING")).unwrap();
+            ArtifactUpload {
+                artifact: Artifact::from(response.data),
+                url: format!("{}{path}", server_url()),
+            }
+        }
+
+        #[tokio::test]
+        async fn create_upload_returns_location_without_following_it() {
+            let location = format!("{}/s3/create_upload", server_url());
+            let target = mock("POST", "/s3/create_upload").expect(0).create();
+            let _m = mock("POST", "/v1/artifacts")
+                .match_header("authorization", "Bearer test-token")
+                .match_body(Matcher::PartialJson(json!({
+                    "data": {
+                        "attributes": { "filename": "app.zip", "filesize": 5 },
+                        "relationships": {
+                            "release": { "data": { "type": "releases", "id": "release-1" } }
+                        }
+                    }
+                })))
+                .with_status(307)
+                .with_header("content-type", "application/vnd.api+json")
+                .with_header("location", &location)
+                .with_body(artifact_body("artifact-1", "WAITING"))
+                .create();
+
+            let upload = create_upload_with_client(&create_test_client(), create_request())
+                .await
+                .expect("create should succeed");
+
+            assert_eq!(upload.url, location);
+            assert_eq!(upload.artifact.id, "artifact-1");
+            assert_eq!(upload.artifact.status, ArtifactStatus::Waiting);
+            target.assert();
+        }
+
+        #[tokio::test]
+        async fn create_upload_fails_without_location() {
+            let _m = mock("POST", "/v1/artifacts")
+                .with_status(201)
+                .with_header("content-type", "application/vnd.api+json")
+                .with_body(artifact_body("artifact-1", "WAITING"))
+                .create();
+
+            let err = create_upload_with_client(&create_test_client(), create_request())
+                .await
+                .expect_err("missing Location should be an error");
+
+            assert!(matches!(err, Error::UnexpectedError(_)));
+        }
+
+        #[tokio::test]
+        async fn upload_file_streams_file_with_content_length() {
+            let path = std::env::temp_dir().join(format!("keygen-rs-{}.bin", uuid::Uuid::new_v4()));
+            tokio::fs::write(&path, b"file contents").await.unwrap();
+            let m = mock("PUT", "/s3/upload_file")
+                .match_header("authorization", Matcher::Missing)
+                .match_header("keygen-version", Matcher::Missing)
+                .match_header("content-length", "13")
+                .match_header("transfer-encoding", Matcher::Missing)
+                .match_body("file contents")
+                .with_status(200)
+                .create();
+
+            let progress = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = progress.clone();
+            let on_progress: UploadProgress = Box::new(move |uploaded, total| {
+                recorded.lock().unwrap().push((uploaded, total));
+            });
+
+            let result = test_upload("/s3/upload_file")
+                .upload_file(&path, Some(on_progress))
+                .await;
+            tokio::fs::remove_file(&path).await.ok();
+
+            result.expect("upload should succeed");
+            m.assert();
+            assert_eq!(progress.lock().unwrap().last(), Some(&(13, 13)));
+        }
+
+        fn temp_file(contents: &[u8]) -> std::path::PathBuf {
+            let path = std::env::temp_dir().join(format!("keygen-rs-{}.bin", uuid::Uuid::new_v4()));
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+
+        #[tokio::test]
+        async fn upload_fails_on_storage_error() {
+            let path = temp_file(b"hello");
+            let _m = mock("PUT", "/s3/upload_denied")
+                .with_status(403)
+                .with_body("<Error><Code>SignatureDoesNotMatch</Code></Error>")
+                .create();
+
+            let result = test_upload("/s3/upload_denied")
+                .upload_file(&path, None)
+                .await;
+            std::fs::remove_file(&path).ok();
+
+            let err = result.expect_err("storage error should be an error");
+            assert!(err.to_string().contains("403"));
+        }
+
+        #[tokio::test]
+        async fn create_and_upload_computes_checksum_and_fetches_artifact() {
+            let path = temp_file(b"abc");
+            let location = format!("{}/s3/create_and_upload", server_url());
+            let _create = mock("POST", "/v1/artifacts")
+                .match_body(Matcher::PartialJson(json!({
+                    "data": { "attributes": {
+                        "filesize": 3,
+                        "checksum": "3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw"
+                    } }
+                })))
+                .with_status(307)
+                .with_header("content-type", "application/vnd.api+json")
+                .with_header("location", &location)
+                .with_body(artifact_body("artifact-cu", "WAITING"))
+                .create();
+            let put = mock("PUT", "/s3/create_and_upload")
+                .match_body("abc")
+                .with_status(200)
+                .create();
+            let _get = mock("GET", "/v1/artifacts/artifact-cu")
+                .with_status(200)
+                .with_header("content-type", "application/vnd.api+json")
+                .with_body(artifact_body("artifact-cu", "UPLOADED"))
+                .create();
+
+            let mut request = create_request();
+            request.filesize = None;
+            let result =
+                create_and_upload_with_client(&create_test_client(), request, &path, None).await;
+            std::fs::remove_file(&path).ok();
+
+            let artifact = result.expect("create and upload should succeed");
+            put.assert();
+            assert_eq!(artifact.status, ArtifactStatus::Uploaded);
+        }
+
+        #[tokio::test]
+        async fn create_and_upload_deletes_artifact_when_upload_fails() {
+            let path = temp_file(b"hello");
+            let location = format!("{}/s3/create_and_upload_denied", server_url());
+            let _create = mock("POST", "/v1/artifacts")
+                .with_status(307)
+                .with_header("content-type", "application/vnd.api+json")
+                .with_header("location", &location)
+                .with_body(artifact_body("artifact-denied", "WAITING"))
+                .create();
+            let _put = mock("PUT", "/s3/create_and_upload_denied")
+                .with_status(403)
+                .create();
+            let delete = mock("DELETE", "/v1/artifacts/artifact-denied")
+                .with_status(204)
+                .create();
+
+            let result =
+                create_and_upload_with_client(&create_test_client(), create_request(), &path, None)
+                    .await;
+            std::fs::remove_file(&path).ok();
+
+            let err = result.expect_err("failed upload should be an error");
+            assert!(err.to_string().contains("403"));
+            delete.assert();
+        }
+
+        #[tokio::test]
+        async fn file_checksum_is_unpadded_base64_sha512() {
+            let path = std::env::temp_dir().join(format!("keygen-rs-{}.bin", uuid::Uuid::new_v4()));
+            tokio::fs::write(&path, b"abc").await.unwrap();
+
+            let checksum = file_checksum(&path).await;
+            tokio::fs::remove_file(&path).await.ok();
+
+            assert_eq!(
+                checksum.unwrap(),
+                "3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw"
+            );
+        }
     }
 }
