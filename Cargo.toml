@@ -51,7 +51,7 @@ serde_urlencoded = "0.7"
 lazy_static = "1.4.0"
 base64 = "0.21.0"
 hex = "0.4.3"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core", "digest"] }
 p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 rsa = { version = "0.9", features = ["pem"] }
 rand = "0.8"
@@ -67,6 +67,7 @@ specta = { version = "2.0.0-rc.22", optional = true, features = [
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.13", features = ["stream"], default-features = false }
 hostname = "0.4.0"
 num_cpus = "1.16.0"
 
@@ -455,6 +456,10 @@ name = "check_for_upgrade"
 path = "examples/release/check_for_upgrade.rs"
 
 [[example]]
+name = "download_release_artifact"
+path = "examples/release/download_release_artifact.rs"
+
+[[example]]
 name = "update_release"
 path = "examples/release/update_release.rs"
 
@@ -475,6 +480,10 @@ name = "release_lifecycle"
 path = "examples/release/release_lifecycle.rs"
 
 [[example]]
+name = "release_with_artifacts"
+path = "examples/release/release_with_artifacts.rs"
+
+[[example]]
 name = "create_package"
 path = "examples/package/create_package.rs"
 
@@ -493,6 +502,10 @@ path = "examples/artifact/get_artifact.rs"
 [[example]]
 name = "list_artifacts"
 path = "examples/artifact/list_artifacts.rs"
+
+[[example]]
+name = "upload_artifact"
+path = "examples/artifact/upload_artifact.rs"
 
 [[example]]
 name = "list_platforms"
